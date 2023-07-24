@@ -1,0 +1,368 @@
+platform :ios do |options|
+  desc 'Fetch certificates and provisioning profiles'
+  lane :certificates do
+    puts "#{ENV['MATCH_ARRAY']}"
+    arr = "#{ENV['MATCH_ARRAY']}".split(',')
+    arr.each do |match_to|
+      UI.message("Match at: #{match_to}")
+      match(app_identifier: ENV['APP_IDENTIFIER'], type: match_to, readonly: true, clone_branch_directly: true)
+    end
+  end
+
+  desc 'Send Notification to Team!'
+  private_lane :notify_teams do
+    lane_name = ARGV[1]
+    git_last_commit_message = sh("git log -1 --pretty=%B")
+    git_user_name = sh("git config user.name")
+    git_user_email = sh("git config user.email")
+    git_last_commit_hash = sh("git rev-parse --short HEAD")
+    git_branch_name = sh("git rev-parse --abbrev-ref HEAD")
+    json = "{
+      \"@type\": \"MessageCard\",
+      \"@context\": \"http://schema.org/extensions\",
+      \"themeColor\": \"0076D7\",
+      \"summary\": \"New build generated\",
+      \"sections\": [{
+          \"activityTitle\": \"🚀 #{ENV['COMMIT_ENV_NAME']} ios app successfully released!\",
+          \"facts\": [{
+              \"name\": \"Git Commit\",
+              \"value\": \"#{git_last_commit_message}\"
+          }, {
+              \"name\": \"Git Branch\",
+              \"value\": \"#{git_branch_name}\"
+          }, {
+              \"name\": \"Git Author\",
+              \"value\": \"#{git_user_name}\"
+          }, {
+              \"name\": \"Git Author Email\",
+              \"value\": \"#{git_user_email}\"
+          }, {
+              \"name\": \"Git Commit Hash\",
+              \"value\": \"#{git_last_commit_hash}\"
+          }, {
+              \"name\": \"Lane\",
+              \"value\": \"#{lane_name}\"
+          }, {
+              \"name\": \"Success\",
+              \"value\": \"true\" 
+          }
+        ],
+          \"markdown\": true
+      }]
+  }"
+    sh("sh ./notify.sh -j '#{json}' -u '#{ENV['TEAMS_WEBHOOK_URL']}'")
+  end
+
+  desc 'Build the iOS application.'
+  lane :build do |options|
+
+    APP_NAME = ENV['APP_NAME']
+    WORKSPACE_PATH = ENV['IOS_WORKSPACE_PATH']
+    PROJECT_PATH = ENV['IOS_PROJECT_PATH']
+    KEYCHAIN_NAME = "login.keychain"
+
+
+    certificates
+    cocoapods( podfile: "./ios/Podfile", use_bundle_exec: false)
+    versions = sh('cat ./VERSION')
+    versionName = versions.split('#')[0]
+    versionCode = versions.split('#')[1]
+    version = get_version_number(xcodeproj: ENV['IOS_PROJECT_PATH'], 'target': ENV['PROJECTNAME'])
+    build_no = get_build_number(xcodeproj: ENV['IOS_PROJECT_PATH'])
+    if versionName.to_s != version.to_s
+      ios_set_version(xcodeproj: ENV['IOS_PROJECT_PATH'], version: versionName.to_s)
+    end
+    if versionCode.to_s != build_no.to_s
+      ios_set_build_number(xcodeproj: ENV['IOS_PROJECT_PATH'], build_number: versionCode.to_i)
+    end
+    Dir.mkdir('./output') unless Dir.exist?('./output')
+    sh('npm run bundle-ios')
+
+    puts "IOS_EXPORT_METHOD. #{ENV['IOS_EXPORT_METHOD']}"
+
+    build_app(
+      scheme: ENV['PROJECTNAME'],
+      silent: false,
+      clean: false,
+      include_symbols: true,
+      include_bitcode: true,
+      workspace: WORKSPACE_PATH,
+      configuration: "Release",
+      output_directory: './output',
+      export_method: ENV['IOS_EXPORT_METHOD'],
+      export_options: {
+        method: ENV['IOS_EXPORT_METHOD']
+      },
+    )
+  end
+
+  desc 'Upload app to app center'
+  private_lane :upload_to_app_center do
+    appcenter_upload(
+      api_token: ENV["TEST_APPCENTER_API_TOKEN"],
+      owner_name: ENV["TEST_APPCENTER_OWNER_NAME"],
+      app_name:ENV["TEST_APPCENTER_APP_NAME_IOS"],
+      ipa: ENV["IOS_IPA_PATH"],
+      destinations: ENV["TEST_APPCENTER_DISTRIBUTE_GROUP"],
+      release_notes: sh("cat #{ENV['TEST_APPCENTER_DISTRIBUTE_RELEASE_NOTES_PATH']}")
+    )
+  end
+
+  desc 'Ship to App Center.'
+  lane :beta do |options|
+    build(options)
+
+    upload_to_app_center
+
+    # upload_to_testflight(skip_submission: true)
+
+    version = get_version_number(xcodeproj: ENV['IOS_PROJECT_PATH'], 'target': ENV['PROJECTNAME'])
+    build_no = get_build_number(xcodeproj: ENV['IOS_PROJECT_PATH'])
+
+    # Tag the submit
+    git_tag = "#{ENV['COMMIT_ENV_NAME']}-ios-" + version + "-" + build_no
+
+    commit_version_bump(
+      xcodeproj: ENV['IOS_PROJECT_PATH'],
+      force: true,
+      message: "Released: Fastlane #{git_tag} ios build - Version: " + version + " - Build: " + build_no
+    )
+
+    add_git_tag(tag: git_tag)
+    push_to_git_remote
+
+    notify_teams
+
+    Dir.mkdir('../output/ipa') unless Dir.exist?('../output/ipa')
+    Dir.mkdir("../output/ipa/#{ENV['ENV_NAME']}") unless Dir.exist?("../output/ipa/#{ENV['ENV_NAME']}")
+    puts "Copying ipa... #{sh("cp ../output/#{ENV['PROJECTNAME']}.ipa ../output/ipa/#{ENV['ENV_NAME']}/#{ENV['ENV_NAME']}_#{version}_#{build_no}.ipa")}"
+  end
+end
+
+platform :android do |options|
+
+  desc 'Build the Android application.'
+  lane :build do |options|
+    versions = sh('cat ./VERSION')
+    versionName = versions.split('#')[0]
+    versionCode = versions.split('#')[1]
+    version = get_version_name(app_project_dir: ENV['ANDROID_PROJECT_PATH'])
+    build_no = get_version_code(app_project_dir: ENV['ANDROID_PROJECT_PATH'])
+    if versionName.to_s != version.to_s
+      android_set_version_name(gradle_file: ENV['ANDROID_GRADLE_PATH'], version_name: versionName.to_s)
+    end
+    if versionCode.to_s != build_no.to_s
+      android_set_version_code(gradle_file: ENV['ANDROID_GRADLE_PATH'], version_code: versionCode.to_i)
+    end
+
+    gradle(task: 'clean', project_dir: 'android/')
+    if !Dir.exist?(ENV['ANDROID_ASSET_PATH'])
+      sh("mkdir #{ENV['ANDROID_ASSET_PATH']}")
+    end
+    sh('npm run bundle-android')
+    gradle(task: 'assemble', build_type: 'Release', project_dir: 'android/')
+  end
+
+  desc 'Upload app to app center'
+  private_lane :upload_to_app_center do
+    appcenter_upload(
+      api_token: ENV["TEST_APPCENTER_API_TOKEN"],
+      owner_name: ENV["TEST_APPCENTER_OWNER_NAME"],
+      app_name: ENV["TEST_APPCENTER_APP_NAME_ANDROID"],
+      apk: "./android/app/build/outputs/apk/release/app-release.apk",
+      destinations: ENV["TEST_APPCENTER_DISTRIBUTE_GROUP"],
+      release_notes: sh("cat #{ENV['TEST_APPCENTER_DISTRIBUTE_RELEASE_NOTES_PATH']}")
+    )
+  end
+
+  desc 'Send Notification to Team!'
+  private_lane :notify_teams do
+    lane_name = ARGV[1]
+    git_last_commit_message = sh("git log -1 --pretty=%B")
+    git_user_name = sh("git config user.name")
+    git_user_email = sh("git config user.email")
+    git_last_commit_hash = sh("git rev-parse --short HEAD")
+    git_branch_name = sh("git rev-parse --abbrev-ref HEAD")
+    json = "{
+      \"@type\": \"MessageCard\",
+      \"@context\": \"http://schema.org/extensions\",
+      \"themeColor\": \"0076D7\",
+      \"summary\": \"New build generated\",
+      \"sections\": [{
+          \"activityTitle\": \"🚀 #{ENV['COMMIT_ENV_NAME']} android app successfully released!\",
+          \"facts\": [{
+              \"name\": \"Git Commit\",
+              \"value\": \"#{git_last_commit_message}\"
+          }, {
+              \"name\": \"Git Branch\",
+              \"value\": \"#{git_branch_name}\"
+          }, {
+              \"name\": \"Git Author\",
+              \"value\": \"#{git_user_name}\"
+          }, {
+              \"name\": \"Git Author Email\",
+              \"value\": \"#{git_user_email}\"
+          }, {
+              \"name\": \"Git Commit Hash\",
+              \"value\": \"#{git_last_commit_hash}\"
+          }, {
+              \"name\": \"Lane\",
+              \"value\": \"#{lane_name}\"
+          }, {
+              \"name\": \"Success\",
+              \"value\": \"true\" 
+          }
+        ],
+          \"markdown\": true
+      }]
+  }"
+    sh("sh ./notify.sh -j '#{json}' -u '#{ENV['TEAMS_WEBHOOK_URL']}'")
+  end
+
+  desc 'Ship to App Center Beta.'
+  lane :beta do |options|
+
+    build(options)
+    upload_to_app_center
+
+    version = get_version_name(app_project_dir: ENV['ANDROID_PROJECT_PATH'])
+    build_no = get_version_code(app_project_dir: ENV['ANDROID_PROJECT_PATH'])
+
+    git_commit(
+      path: ['./android/app/build.gradle', './*'],
+      message: "Released: #{ENV['COMMIT_ENV_NAME']} Fastlane android build - Version: " + version + " - Build: " + build_no
+    )
+
+    # Tag the submit
+    git_tag = "#{ENV['COMMIT_ENV_NAME']}-android-" + version + "-" + build_no
+    add_git_tag(tag: git_tag)
+    push_to_git_remote
+    notify_teams
+    Dir.mkdir('../output') unless Dir.exist?('../output')
+    Dir.mkdir('../output/apk') unless Dir.exist?('../output/apk')
+    Dir.mkdir("../output/apk/#{ENV['ENV_NAME']}") unless Dir.exist?("../output/apk/#{ENV['ENV_NAME']}")
+    puts "Copying latest apk... #{sh("cp .#{ENV['ANDROID_APK_PATH']} ../output/#{ENV['PROJECTNAME']}.apk")}"
+    puts "Copying apk... #{sh("cp .#{ENV['ANDROID_APK_PATH']} ../output/apk/#{ENV['ENV_NAME']}#{version}_#{build_no}.apk")}"
+  end
+
+end
+
+platform :changelog do |options|
+
+  desc "Get new version name."
+  private_lane :get_new_version_names do |options|
+    if !options[:bump_type]
+      bump_type = UI.select("Select version increment option: ", ["major", "minor", "patch"])
+    else
+      bump_type = options[:bump_type]
+    end
+    UI.success("Selected bump type: #{bump_type}")
+    bump_type
+  end
+
+  desc 'Build the Changelog File.'
+  lane :build_changelog do |options|
+    bump_type = get_new_version_names(options)
+    versionFile = sh('cat ./VERSION')
+    versions = versionFile.strip.split('#')
+    versionName = versions[0]
+    versionCode = versions[1]
+    majorVersion = versionName.split('.')[0]
+    minorVersion = versionName.split('.')[1]
+    patchVersion = versionName.split('.')[2]
+
+    if bump_type == 'patch'
+      patchVersion = patchVersion.to_i + 1
+    elsif bump_type == 'minor'
+      patchVersion = 0
+      minorVersion = minorVersion.to_i + 1
+    elsif bump_type == 'major'
+      patchVersion = 0
+      minorVersion = 0
+      majorVersion = majorVersion.to_i + 1
+    end
+    
+    versionCode = versionCode.to_i + 1
+    newVersion = "#{majorVersion}.#{minorVersion}.#{patchVersion}"
+    newVersionFile = newVersion.to_s.strip + '#'.strip + versionCode.to_s.strip
+
+    sh("echo #{newVersionFile.strip} > ./VERSION")
+
+    time = Time.now.strftime("%d-%m-%y %H:%M")
+    git_branch_name = sh("git rev-parse --abbrev-ref HEAD")
+    file1 = sh('cat ./lastCommit')
+    fromCommit = file1.strip
+    changelog = changelog_from_git_commits(
+      between: [fromCommit, "HEAD"],
+      pretty: "# %s \n\n",
+      date_format: "short",
+      merge_commit_filtering: "exclude_merges",
+    )
+    addedStrings = '### Added 🎁'
+    fixedStrings = '### Fixed 🛠'
+    removedStrings = '### Removed 🚫'
+    changedStrings = '### Changed 🔁'
+    deprecatedStrings = '### Deprecated ❗️'
+    securityStrings = '### Security 🔒'
+    haveAdded = false
+    haveFixed = false
+    haveRemoved = false
+    haveChanged = false
+    haveDeprecated = false
+    haveSecurity = false
+    changelogStrings = changelog.split("#")
+
+    for i in changelogStrings do
+      i = i.strip
+      if i.include?("Added: ")
+        addedStrings = addedStrings + "\n" + "- " + i.delete_prefix("Added:") + "\n"
+        haveAdded = true
+      elsif i.include?("Fixed: ")
+        fixedStrings = fixedStrings + "\n" + "- " + i.delete_prefix("Fixed:") + "\n"
+        haveFixed = true
+      elsif i.include?("Removed: ")
+        removedStrings =removedStrings + "\n" + "- " + i.delete_prefix("Removed:") + "\n"
+        haveRemoved = true
+      elsif i.include?("Changed: ")
+        changedStrings = changedStrings + "\n" + "- " + i.delete_prefix("Changed:") + "\n"
+        haveChanged = true
+      elsif i.include?("Deprecated: ")
+        deprecatedStrings = deprecatedStrings + "\n" + "- " + i.delete_prefix("Deprecated:") + "\n"
+        haveDeprecated = true
+      elsif i.include?("Security: ")
+        securityStrings = securityStrings + "\n" + "- " + i.delete_prefix("Security:") + "\n"
+        haveSecurity = true
+      else
+        next
+      end
+    end
+
+    changelog = '## ' + newVersion.to_s.strip + ' (' + versionCode.to_s.strip + ')' + ' (' + time + ')' + ' (' + git_branch_name.strip + ')' + "\n"
+    if haveAdded
+      changelog = changelog + addedStrings + "\n"
+    end
+    if haveFixed
+      changelog = changelog + fixedStrings + "\n"
+    end
+    if haveRemoved
+      changelog = changelog + removedStrings + "\n"
+    end
+    if haveChanged
+      changelog = changelog + changedStrings + "\n"
+    end
+    if haveDeprecated
+      changelog = changelog + deprecatedStrings + "\n"
+    end
+    if haveSecurity
+      changelog = changelog + securityStrings + "\n"
+    end
+    
+    newLastCommit = last_git_commit
+    newHash = newLastCommit[:abbreviated_commit_hash]
+    sh("echo '#{newHash}' > ./lastcommit")
+    
+    previousChangelog = sh("cat ../CHANGELOG.md")
+    previousChange = previousChangelog.split("# Changelog")
+    File.write("../CHANGELOG.md","\# Changelog \n #{changelog}\n#{previousChange[1]}", mode: "w")
+  end
+end
